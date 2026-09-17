@@ -29,6 +29,7 @@ MANIFEST
 chroma
 
 data
+01-baseline_rag/data
 
 01-baseline_rag/data/invest-on-invent-KG.json
 01-baseline_rag/rag/res/huqie.txt.trie

@@ -4,14 +4,24 @@
 @Author: janic
 @File: rag_sub_query.py
 """
+from langchain_chroma import Chroma
 from langchain_classic.chains.llm import LLMChain
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, FewShotChatMessagePromptTemplate
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.stores import InMemoryByteStore
+from langchain_classic.retrievers.multi_vector import MultiVectorRetriever
+from typing import List
+# from langchain_core.pydantic_v1 import BaseModel, Field, validator
+from langchain_core.output_parsers import PydanticOutputParser
+from pydantic import BaseModel, Field, field_validator
+
 
 from model import QwenLLM, RagEmbedding
 
-from rag_pipline import run_rag_pipline
+from rag_pipline import run_rag_pipline, chroma_client
 
 langchain_llm = QwenLLM()
 embedding_model = RagEmbedding()
@@ -104,7 +114,177 @@ def take_step_back(query):
     return res.split("<|endoftext|>")[0]
 
 
-query3 = "我有事外出，要怎么办"
-new_query = take_step_back(query3)
-res3 = run_rag_pipline(new_query, new_query, k=3)
-print(res3)
+# query3 = "我有事外出，要怎么办"
+# new_query = take_step_back(query3)
+# res3 = run_rag_pipline(new_query, new_query, k=3)
+# print(res3)
+
+
+import pickle
+
+with open("./data/zhidu_db.pickl", "rb") as file:
+    doc_txts = pickle.load(file)
+
+doc_ids = list(doc_txts.keys())
+docs = list(doc_txts.values())
+# print(docs[:4])
+
+chile_text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=64,
+    chunk_overlap=15,
+    separators=["\n\n",
+              "\n",
+              ".",
+              "\uff0e",  # Fullwidth full stop
+               "\u3002",  # Ideographic full stop
+              ",",
+              "\uff0c",  # Fullwidth comma
+              "\u3001",  # Ideographic comma
+             ])
+
+sub_docs = []
+id_key = "doc_id"
+index_type = "sm_chunk"
+
+for i, doc in enumerate(docs):
+    _id = doc_ids[i]
+    if doc.metadata["is_table"] == 1:
+        _doc = Document(page_content=doc.page_content,
+                        metadata={"type": index_type, id_key: _id})
+        sub_docs.extend([_doc])
+        continue
+
+    _sub_docs = chile_text_splitter.split_documents([doc])
+
+    for _doc in _sub_docs:
+        _doc.metadata[id_key] = _id
+        _doc.metadata["type"] = index_type
+
+    sub_docs.extend(_sub_docs)
+
+# print(sub_docs)
+
+sm_chunk_db = Chroma.from_documents(sub_docs,
+                                    embedding_model.get_embedding_fun(),
+                                    client=chroma_client,
+                                    collection_name="zhidu_db_sm_chunk")
+
+store = InMemoryByteStore()
+id_key = "doc_id"
+
+retriever = MultiVectorRetriever(
+    vectorstore=sm_chunk_db,
+    byte_store=store,
+    id_key=id_key
+)
+
+# retriever.docstore.mset(list(zip(doc_ids, docs)))
+
+# query4 = "出差交通费怎么算？"
+# res4 = retriever.invoke(query4)
+# print(res4)
+#
+# answer4 = sm_chunk_db.similarity_search(query4, k=2)
+# print(answer4)
+
+# llm = QwenLLM()
+# prompt_template = "你是企业员工助手，熟悉公司考勤和报销标准等规章制度。请根据下面的文档:\n\n{doc}\n 做一个简短的概括摘要改写，字数50字，并给出关键词"
+#
+# chain = (
+#     {"doc": lambda x: x.page_content}
+#     | ChatPromptTemplate.from_template(prompt_template)
+#     | llm
+#     | StrOutputParser()
+# )
+#
+# summaries = chain.batch(docs, {"max_concurrency": 1})
+#
+# summary_docs = []
+# id_key = "doc_id"
+# index_type = "summary"
+# for i, s in enumerate(summaries):
+#     _id = doc_ids[i]
+#     doc = docs[i]
+#     if doc.metadata["is_table"] == 1:
+#         _doc = Document(page_content=doc.page_content,
+#                         metadata={"type": index_type, id_key: _id})
+#         summary_docs.extend([_doc])
+#         continue
+#
+#     _s = Document(page_content=s,
+#                   metadata={"type": index_type, id_key: _id})
+#
+#     summary_docs.extend([_s])
+
+# summary_chunk_db = Chroma.from_documents(summary_docs,
+#                                          embedding_model.get_embedding_fun(),
+#                                          client=chroma_client,
+#                                          collection_name="zhidu_db_summary")
+# store = InMemoryByteStore()
+# id_key = "doc_id"
+# summary_retriever = MultiVectorRetriever(
+#     vectorstore=summary_chunk_db,
+#     byte_store=store,
+#     id_key=id_key
+# )
+# summary_retriever.docstore.mset(list(zip(doc_ids, docs)))
+#
+# query5 = "出差交通费怎么算"
+# res5 = summary_retriever.invoke(query5)
+# print(res5)
+
+chain = (
+    {"doc": lambda x: x.page_content}
+    | ChatPromptTemplate.from_template(
+    "你是企业员工助手，熟悉公司考勤和报销标准等规章制度。你的任务是提出在下面文档的内容中可以找到答案的3个假设性问题。:\n\n{doc}, 要求输出为中文，不包含解释性内容，格式列表格式如['问题1'， '问题2', '问题3'] "
+    )
+    | llm
+)
+
+# chain.invoke(docs[4])
+
+
+class HypotheticalQuestions(BaseModel):
+    questions: List[str] = Field(..., description="List of questions")
+
+
+question_docs = []
+id_key = "doc_id"
+index_type = "hq"
+for i, doc in enumerate(docs):
+    _id = doc_ids[i]
+    for _ in range(3):
+        try:
+            hq = chain.invoke(doc)
+            res = eval(hq)
+            q = HypotheticalQuestions(questions=res)
+            for i, question in enumerate(q.questions):
+                question_docs.extend(
+                    [Document(page_content=question, metadata={"type": index_type, id_key:_id})]
+                )
+            break
+        except:
+            continue
+
+
+hq_chunk_db = Chroma.from_documents(question_docs,
+                                    embedding_model.get_embedding_fun(),
+                                    client=chroma_client,
+                                    collection_name="zhidu_db_hq")
+
+store = InMemoryByteStore()
+id_key = "doc_id"
+
+hq_retriever = MultiVectorRetriever(
+    vectorstore=hq_chunk_db,
+    byte_store=store,
+    id_key=id_key
+)
+
+hq_retriever.docstore.mset(list(zip(doc_ids, docs)))
+query = "出差交通费怎么算？"
+res6 = hq_retriever.invoke(query)
+# print(res6)
+
+answer6 = hq_chunk_db.similarity_search(query, k=2)
+print(answer6)
